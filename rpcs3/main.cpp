@@ -132,7 +132,17 @@ LOG_CHANNEL(q_debug, "QDEBUG");
 		}
 
 		const system_state state = Emu.GetStatus(false);
-		fmt::append(buf, "\nTitle: \"%s\" (emulation is %s)", state == system_state::stopped ? "N/A" : Emu.GetTitleAndTitleID(), state <= system_state::stopping ? "stopped" : "running");
+
+		if (state == system_state::stopped)
+		{
+			fmt::append(buf, "\nEmulation is stopped");
+		}
+		else
+		{
+			const std::string& name = Emu.GetTitleAndTitleID();
+			fmt::append(buf, "\nTitle: \"%s\" (emulation is %s)", name.empty() ? "N/A" : name.data(), state == system_state::stopping ? "stopping" : "running");
+		}
+
 		fmt::append(buf, "\nBuild: \"%s\"", rpcs3::get_verbose_version());
 		fmt::append(buf, "\nDate: \"%s\"", std::chrono::system_clock::now());
 	}
@@ -1378,56 +1388,3 @@ int main(int argc, char** argv)
 	// run event loop (maybe only needed for the gui application)
 	return app->exec();
 }
-
-// Temporarily, this is code from std for prebuilt LLVM. I don't understand why this is necessary.
-// From the same MSVC 19.27.29112.0, LLVM libs depend on these, but RPCS3 gets linker errors.
-#ifdef _WIN32
-extern "C"
-{
-	int __stdcall __std_init_once_begin_initialize(void** ppinit, ulong f, int* fp, void** lpc) noexcept
-	{
-		return InitOnceBeginInitialize(reinterpret_cast<LPINIT_ONCE>(ppinit), f, fp, lpc);
-	}
-
-	int __stdcall __std_init_once_complete(void** ppinit, ulong f, void* lpc) noexcept
-	{
-		return InitOnceComplete(reinterpret_cast<LPINIT_ONCE>(ppinit), f, lpc);
-	}
-
-	usz __stdcall __std_get_string_size_without_trailing_whitespace(const char* str, usz size) noexcept
-	{
-		while (size)
-		{
-			switch (str[size - 1])
-			{
-			case 0:
-			case ' ':
-			case '\n':
-			case '\r':
-			case '\t':
-			{
-				size--;
-				continue;
-			}
-			default: break;
-			}
-
-			break;
-		}
-
-		return size;
-	}
-
-	usz __stdcall __std_system_error_allocate_message(const unsigned long msg_id, char** ptr_str) noexcept
-	{
-		return __std_get_string_size_without_trailing_whitespace(*ptr_str, FormatMessageA(
-			FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-			nullptr, msg_id, 0, reinterpret_cast<char*>(ptr_str), 0, nullptr));
-	}
-
-	void __stdcall __std_system_error_deallocate_message(char* s) noexcept
-	{
-		LocalFree(s);
-	}
-}
-#endif
