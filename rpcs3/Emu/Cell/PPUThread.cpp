@@ -35,6 +35,7 @@
 #pragma GCC diagnostic ignored "-Wold-style-cast"
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 #pragma GCC diagnostic ignored "-Wmissing-noreturn"
+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif
 #include <llvm/IR/Verifier.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
@@ -3481,17 +3482,17 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 	{
 		extern atomic_t<u32> liblv2_begin, liblv2_end;
 
-		const u32 notify = ppu.res_notify;
-
-		if (notify)
-		{
-			vm::reservation_notifier(notify).notify_all();
-			ppu.res_notify = 0;
-		}
-
 		// Avoid notifications from lwmutex or sys_spinlock
-		if (ppu.cia < liblv2_begin || ppu.cia >= liblv2_end)
+		if (new_data != old_data && (ppu.cia < liblv2_begin || ppu.cia >= liblv2_end))
 		{
+			const u32 notify = ppu.res_notify;
+
+			if (notify)
+			{
+				vm::reservation_notifier(notify).notify_all();
+				ppu.res_notify = 0;
+			}
+
 			if (!notify)
 			{
 				// Try to postpone notification to when PPU is asleep or join notifications on the same address
@@ -5055,11 +5056,18 @@ bool ppu_initialize(const ppu_module& info, bool check_only, u64 file_size)
 	// Try to patch all single and unregistered BLRs with the same function (TODO: Maybe generalize it into PIC code detection and patching)
 	ppu_intrp_func_t BLR_func = nullptr;
 
-	const bool is_first = jit && !jit_mod.init;
-
 	const bool showing_only_apply_stage = !g_progr.load() && !g_progr_ptotal && !g_progr_ftotal && g_progr_ptotal.compare_and_swap_test(0, 1);
 
 	progr = "Applying PPU Code...";
+
+	if (!jit)
+	{
+		// No functions - nothing to do
+		ensure(info.funcs.empty());
+		return compiled_new;
+	}
+
+	const bool is_first = !jit_mod.init;
 
 	if (is_first)
 	{

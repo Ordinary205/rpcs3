@@ -35,6 +35,7 @@ const extern spu_decoder<spu_iflag> g_spu_iflag;
 #pragma GCC diagnostic ignored "-Wold-style-cast"
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 #pragma GCC diagnostic ignored "-Wmissing-noreturn"
+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif
 #include <llvm/ADT/PostOrderIterator.h>
 #include <llvm/Analysis/PostDominators.h>
@@ -160,7 +161,8 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 		// Store reordering/elimination protection
 		std::array<usz, s_reg_max> store_context_last_id = fill_array<usz>(0); // Protects against illegal forward ordering
 		std::array<usz, s_reg_max> store_context_first_id = fill_array<usz>(usz{umax}); // Protects against illegal past store elimination (backwards ordering is not implemented)
-		std::array<usz, s_reg_max> store_context_ctr = fill_array<usz>(1); // Store barrier cointer
+		std::array<usz, s_reg_max> store_context_ctr = fill_array<usz>(1); // Store barrier counter
+		bool has_gpr_memory_barriers = false; // Summarizes whether GPR barriers exist this block (as if checking all store_context_ctr entries)
 
 		bool does_gpr_barrier_proceed_last_store(u32 i) const noexcept
 		{
@@ -501,8 +503,6 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 			m_ir->SetInsertPoint(cblock);
 			return result;
 		}
-
-		ensure(!absolute);
 
 		auto& result = m_blocks[target].block;
 
@@ -1672,10 +1672,14 @@ public:
 
 			std::vector<block_info*> block_q;
 			block_q.reserve(m_blocks.size());
+
+			bool has_gpr_memory_barriers = false;
+
 			for (auto& [a, b] : m_blocks)
 			{
 				block_q.emplace_back(&b);
 				bb_to_info[b.block] = &b;
+				has_gpr_memory_barriers |= b.has_gpr_memory_barriers;
 			}
 
 			for (usz bi = 0; bi < block_q.size();)
@@ -1683,7 +1687,7 @@ public:
 				auto bqbi = block_q[bi++];
 
 				// TODO: process all registers up to s_reg_max
-				for (u32 i = 0; i < 128; i++)
+				for (u32 i = 0; i <= s_reg_127; i++)
 				{
 					// Check if the store is beyond the last barrier
 					if (auto& bs = bqbi->store[i]; bs && !bqbi->does_gpr_barrier_proceed_last_store(i))
@@ -1732,16 +1736,28 @@ public:
 
 						// Find nearest common post-dominator
 						llvm::BasicBlock* common_pdom = killers[0];
+
+						if (has_gpr_memory_barriers)
+						{
+							// Cannot optimize block walk-through, need to inspect all possible memory barriers in the way
+							common_pdom = nullptr;
+						}
+
 						for (auto* bbb : llvm::drop_begin(killers))
 						{
 							if (!common_pdom)
+							{
 								break;
+							}
+
 							common_pdom = pdt.findNearestCommonDominator(common_pdom, bbb);
 						}
 
 						// Shortcut
-						if (!pdt.dominates(common_pdom, bs->getParent()))
+						if (common_pdom && !pdt.dominates(common_pdom, bs->getParent()))
+						{
 							common_pdom = nullptr;
+						}
 
 						// Look for possibly-dead store in CFG starting from the exit nodes
 						llvm::SetVector<llvm::BasicBlock*> work_list;
@@ -1878,7 +1894,7 @@ public:
 
 			for (usz bi = 0; bi < block_q.size(); bi++)
 			{
-				for (u32 i = 0; i < 128; i++)
+				for (u32 i = 0; i <= s_reg_127; i++)
 				{
 					// If store isn't erased, try to sink it
 					if (auto& bs = block_q[bi]->store[i]; bs && block_q[bi]->bb->targets.size() > 1 && !block_q[bi]->does_gpr_barrier_proceed_last_store(i))
@@ -2749,6 +2765,7 @@ public:
 		{
 			// Make previous stores not able to be reordered beyond this point or be deleted
 			std::for_each(m_block->store_context_ctr.begin(), m_block->store_context_ctr.end(), FN(x++));
+			m_block->has_gpr_memory_barriers = true;
 		}
 	}
 
@@ -3103,14 +3120,25 @@ public:
 		_spu->do_mfc();
 	}
 
+	template <bool Saveable>
 	static void exec_mfc_cmd(spu_thread* _spu)
 	{
+		if constexpr (!Saveable)
+		{
+			_spu->unsavable = true;
+		}
+
 		if (!_spu->process_mfc_cmd() || _spu->state & cpu_flag::again)
 		{
 			fmt::throw_exception("exec_mfc_cmd(): Should not abort!");
 		}
 
 		static_cast<void>(_spu->test_stopped());
+
+		if constexpr (!Saveable)
+		{
+			_spu->unsavable = false;
+		}
 	}
 
 	void WRCH(spu_opcode_t op) //
@@ -3289,8 +3317,17 @@ public:
 				case MFC_GETLB_CMD:
 				case MFC_GETLF_CMD:
 				{
+					m_ir->CreateBr(next);
+					m_ir->SetInsertPoint(exec);
+					m_ir->CreateUnreachable();
+					m_ir->SetInsertPoint(fail);
+					m_ir->CreateUnreachable();
+					m_ir->SetInsertPoint(next);
+					m_ir->CreateStore(ci, spu_ptr<u8>(&spu_thread::ch_mfc_cmd, &spu_mfc_cmd::cmd));
+					update_pc();
 					ensure_gpr_stores();
-					[[fallthrough]];
+					call("spu_exec_mfc_cmd_saveable", &exec_mfc_cmd<true>, m_thread);
+					return;
 				}
 				case MFC_SDCRZ_CMD:
 				case MFC_GETLLAR_CMD:
@@ -3307,7 +3344,7 @@ public:
 					m_ir->SetInsertPoint(next);
 					m_ir->CreateStore(ci, spu_ptr<u8>(&spu_thread::ch_mfc_cmd, &spu_mfc_cmd::cmd));
 					update_pc();
-					call("spu_exec_mfc_cmd", &exec_mfc_cmd, m_thread);
+					call("spu_exec_mfc_cmd", &exec_mfc_cmd<false>, m_thread);
 					return;
 				}
 				case MFC_SNDSIG_CMD:
@@ -3366,7 +3403,7 @@ public:
 					}
 
 					m_ir->CreateStore(ci, spu_ptr<u8>(&spu_thread::ch_mfc_cmd, &spu_mfc_cmd::cmd));
-					call("spu_exec_mfc_cmd", &exec_mfc_cmd, m_thread);
+					call("spu_exec_mfc_cmd", &exec_mfc_cmd<false>, m_thread);
 					m_ir->CreateBr(next);
 					m_ir->SetInsertPoint(copy);
 
@@ -7623,10 +7660,14 @@ public:
 			return;
 		}
 
+		const auto compiled_pos = m_ir->getInt32(m_pos);
 		const u32 target = spu_branch_target(0, op.i16);
 
 		m_block->block_end = m_ir->GetInsertBlock();
-		m_ir->CreateBr(add_block(target, true));
+		const auto real_pos = get_pc(m_pos);
+		value_t<u32> target_val;
+		target_val.value = m_ir->getInt32(target);
+		m_ir->CreateCondBr(m_ir->CreateICmpEQ(real_pos, compiled_pos), add_block(target, true), add_block_indirect({}, target_val));
 	}
 
 	void BRASL(spu_opcode_t op) //
